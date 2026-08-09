@@ -4,27 +4,59 @@ library(DT)
 library(ggplot2)
 library(dplyr)
 library(readr)
-library(scales)
+library(httr2)
+library(jsonlite)
+library(digest)
 
 # ============================================================
-# FOOTBALL RANKING SHINY APP
+# WEB FOOTBALL RANKING
+# Public ranking + admin-only match entry
+# Persistent storage: Dropbox CSV
 # ============================================================
 
+# ----------------------------
+# REQUIRED ENVIRONMENT VARIABLES
+# ----------------------------
+# ADMIN_PASSWORD_HASH : SHA-256 hash of your admin password
+# DROPBOX_TOKEN       : Dropbox API access token
+#
+# Optional:
+# DROPBOX_MATCHES_PATH : default "/football-ranking/matches.csv"
+
+ADMIN_PASSWORD_HASH <- Sys.getenv("ADMIN_PASSWORD_HASH")
+DROPBOX_TOKEN <- Sys.getenv("DROPBOX_TOKEN")
+DROPBOX_MATCHES_PATH <- Sys.getenv(
+  "DROPBOX_MATCHES_PATH",
+  unset = "/football-ranking/matches.csv"
+)
+
+# Local fallback is useful while testing in RStudio.
+LOCAL_MATCHES_FILE <- "matches_local.csv"
 PLAYERS_FILE <- "players.csv"
-MATCHES_FILE <- "matches.csv"
-
-# ----------------------------
-# Rating rules
-# ----------------------------
 
 participation_bonus <- 11
 
-stage_rules <- data.frame(
-  stage = c("Group Stage", "Round of 16", "Quarterfinal", "Semifinal", "Final"),
-  win_base = c(10, 12, 14, 16, 20),
-  loss_base = c(10, 9, 8, 7, 6),
-  stringsAsFactors = FALSE
+stage_rules <- tibble::tribble(
+  ~stage,          ~win_base, ~loss_base,
+  "Group Stage",          10,         10,
+  "Round of 16",          12,          9,
+  "Quarterfinal",         14,          8,
+  "Semifinal",            16,          7,
+  "Final",                20,          6
 )
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+hash_password <- function(password) {
+  digest(password, algo = "sha256", serialize = FALSE)
+}
+
+is_admin_password_valid <- function(password) {
+  if (ADMIN_PASSWORD_HASH == "") return(FALSE)
+  identical(hash_password(password), ADMIN_PASSWORD_HASH)
+}
 
 gap_adjustment <- function(gap) {
   if (gap <= 20) return(0)
@@ -32,7 +64,7 @@ gap_adjustment <- function(gap) {
   if (gap <= 60) return(0.50)
   if (gap <= 80) return(0.70)
   if (gap <= 100) return(1.00)
-  return(1.50)
+  1.50
 }
 
 draw_bonus <- function(gap) {
@@ -41,38 +73,8 @@ draw_bonus <- function(gap) {
   if (gap <= 60) return(2)
   if (gap <= 80) return(3)
   if (gap <= 100) return(4)
-  return(5)
+  5
 }
-
-# ----------------------------
-# Initial player database
-# These are the current values after the first recorded cup.
-# ----------------------------
-
-default_players <- tibble::tribble(
-  ~player, ~base_rating, ~base_matches, ~base_wins, ~base_losses, ~base_gf, ~base_ga,
-  "Naser", 373, 4, 4, 0, 29, 17,
-  "Tanha", 347, 4, 3, 1, 34, 25,
-  "Rezgar", 330, 3, 2, 1, 16, 11,
-  "Abolfazl", 318, 2, 1, 1, 11, 17,
-  "Sepehri", 303, 1, 0, 1, 6, 7,
-  "Sia", 303, 1, 0, 1, 3, 6,
-  "Tohid", 303, 1, 0, 1, 8, 12,
-  "Firoozi", 303, 1, 0, 1, 3, 7,
-  "Ali Af", 302, 1, 0, 1, 2, 4,
-  "Ghajar", 302, 1, 0, 1, 3, 6,
-  "Mortazavi", 302, 1, 0, 1, 4, 7,
-  "Vahid", 300, 0, 0, 0, 0, 0,
-  "Ahmad", 300, 0, 0, 0, 0, 0,
-  "Mori", 300, 0, 0, 0, 0, 0,
-  "M Fadaei", 300, 0, 0, 0, 0, 0,
-  "Mhdi", 300, 0, 0, 0, 0, 0,
-  "A Aa", 300, 0, 0, 0, 0, 0,
-  "Reza Shokri", 300, 0, 0, 0, 0, 0,
-  "Mojtaba Elyasi", 300, 0, 0, 0, 0, 0,
-  "Seyed Behdad Arshahi", 300, 0, 0, 0, 0, 0,
-  "Mehdi Mameshli", 300, 0, 0, 0, 0, 0
-)
 
 empty_matches <- tibble(
   match_id = integer(),
@@ -83,70 +85,166 @@ empty_matches <- tibble(
   goals_a = integer(),
   player_b = character(),
   goals_b = integer(),
-  rating_a_before = numeric(),
-  rating_b_before = numeric(),
-  participation_a = numeric(),
-  participation_b = numeric(),
-  rating_change_a = numeric(),
-  rating_change_b = numeric(),
-  rating_a_after = numeric(),
-  rating_b_after = numeric()
+  rating_a_before = double(),
+  rating_b_before = double(),
+  participation_a = double(),
+  participation_b = double(),
+  rating_change_a = double(),
+  rating_change_b = double(),
+  rating_a_after = double(),
+  rating_b_after = double()
 )
 
-# ----------------------------
-# File helpers
-# ----------------------------
+normalize_matches <- function(x) {
+  if (is.null(x) || nrow(x) == 0) return(empty_matches)
 
-ensure_files <- function() {
-  if (!file.exists(PLAYERS_FILE)) {
-    write_csv(default_players, PLAYERS_FILE)
+  required <- names(empty_matches)
+  for (nm in required) {
+    if (!nm %in% names(x)) x[[nm]] <- NA
   }
-  if (!file.exists(MATCHES_FILE)) {
-    write_csv(empty_matches, MATCHES_FILE)
-  }
+
+  x <- x[, required]
+
+  x %>%
+    mutate(
+      match_id = as.integer(match_id),
+      date = as.Date(date),
+      cup = as.character(cup),
+      stage = as.character(stage),
+      player_a = as.character(player_a),
+      goals_a = as.integer(goals_a),
+      player_b = as.character(player_b),
+      goals_b = as.integer(goals_b),
+      rating_a_before = as.numeric(rating_a_before),
+      rating_b_before = as.numeric(rating_b_before),
+      participation_a = as.numeric(participation_a),
+      participation_b = as.numeric(participation_b),
+      rating_change_a = as.numeric(rating_change_a),
+      rating_change_b = as.numeric(rating_change_b),
+      rating_a_after = as.numeric(rating_a_after),
+      rating_b_after = as.numeric(rating_b_after)
+    )
 }
+
+# ============================================================
+# DROPBOX STORAGE
+# ============================================================
+
+dropbox_enabled <- function() {
+  nzchar(DROPBOX_TOKEN)
+}
+
+dropbox_download_matches <- function() {
+  if (!dropbox_enabled()) {
+    if (!file.exists(LOCAL_MATCHES_FILE)) return(empty_matches)
+    return(
+      normalize_matches(
+        read_csv(LOCAL_MATCHES_FILE, show_col_types = FALSE)
+      )
+    )
+  }
+
+  req <- request("https://content.dropboxapi.com/2/files/download") %>%
+    req_headers(
+      Authorization = paste("Bearer", DROPBOX_TOKEN),
+      `Dropbox-API-Arg` = toJSON(
+        list(path = DROPBOX_MATCHES_PATH),
+        auto_unbox = TRUE
+      )
+    )
+
+  resp <- tryCatch(req_perform(req), error = function(e) NULL)
+
+  # File does not exist yet -> start empty
+  if (is.null(resp) || resp_status(resp) >= 400) {
+    return(empty_matches)
+  }
+
+  tmp <- tempfile(fileext = ".csv")
+  writeBin(resp_body_raw(resp), tmp)
+
+  normalize_matches(
+    read_csv(tmp, show_col_types = FALSE)
+  )
+}
+
+dropbox_upload_matches <- function(x) {
+  x <- normalize_matches(x)
+
+  # Always keep a local cache in the app folder while running locally.
+  write_csv(x, LOCAL_MATCHES_FILE)
+
+  if (!dropbox_enabled()) return(invisible(TRUE))
+
+  tmp <- tempfile(fileext = ".csv")
+  write_csv(x, tmp)
+
+  req <- request("https://content.dropboxapi.com/2/files/upload") %>%
+    req_headers(
+      Authorization = paste("Bearer", DROPBOX_TOKEN),
+      `Dropbox-API-Arg` = toJSON(
+        list(
+          path = DROPBOX_MATCHES_PATH,
+          mode = "overwrite",
+          autorename = FALSE,
+          mute = TRUE,
+          strict_conflict = FALSE
+        ),
+        auto_unbox = TRUE
+      ),
+      `Content-Type` = "application/octet-stream"
+    ) %>%
+    req_body_file(tmp)
+
+  resp <- req_perform(req)
+
+  if (resp_status(resp) >= 300) {
+    stop("Dropbox upload failed.")
+  }
+
+  invisible(TRUE)
+}
+
+# ============================================================
+# DATA + RATING ENGINE
+# ============================================================
 
 load_players <- function() {
   read_csv(PLAYERS_FILE, show_col_types = FALSE)
 }
-
-load_matches <- function() {
-  x <- read_csv(MATCHES_FILE, show_col_types = FALSE)
-  if (nrow(x) > 0) x$date <- as.Date(x$date)
-  x
-}
-
-save_matches <- function(x) {
-  write_csv(x, MATCHES_FILE)
-}
-
-ensure_files()
-
-# ----------------------------
-# Core calculations
-# ----------------------------
 
 player_rating_before_new_match <- function(player_name, players, matches) {
   base <- players %>%
     filter(player == player_name) %>%
     pull(base_rating)
 
-  if (length(base) == 0) return(300)
+  if (length(base) == 0) base <- 300
 
-  deltas <- matches %>%
-    filter(player_a == player_name | player_b == player_name) %>%
-    mutate(
-      delta = ifelse(player_a == player_name, rating_change_a, rating_change_b),
-      participation = ifelse(player_a == player_name, participation_a, participation_b)
-    )
+  pm <- matches %>%
+    filter(player_a == player_name | player_b == player_name)
 
-  base + sum(deltas$delta, na.rm = TRUE) + sum(deltas$participation, na.rm = TRUE)
+  if (nrow(pm) == 0) return(base)
+
+  delta <- sum(
+    ifelse(pm$player_a == player_name, pm$rating_change_a, pm$rating_change_b),
+    na.rm = TRUE
+  )
+
+  bonus <- sum(
+    ifelse(pm$player_a == player_name, pm$participation_a, pm$participation_b),
+    na.rm = TRUE
+  )
+
+  base + delta + bonus
 }
 
 already_joined_cup <- function(player_name, cup_name, matches) {
+  if (nrow(matches) == 0) return(FALSE)
+
   any(
     matches$cup == cup_name &
-      (matches$player_a == player_name | matches$player_b == player_name)
+      (matches$player_a == player_name | matches$player_b == player_name),
+    na.rm = TRUE
   )
 }
 
@@ -155,8 +253,17 @@ calculate_match <- function(player_a, goals_a, player_b, goals_b, stage, cup, pl
   rating_a_base <- player_rating_before_new_match(player_a, players, matches)
   rating_b_base <- player_rating_before_new_match(player_b, players, matches)
 
-  participation_a <- ifelse(already_joined_cup(player_a, cup, matches), 0, participation_bonus)
-  participation_b <- ifelse(already_joined_cup(player_b, cup, matches), 0, participation_bonus)
+  participation_a <- ifelse(
+    already_joined_cup(player_a, cup, matches),
+    0,
+    participation_bonus
+  )
+
+  participation_b <- ifelse(
+    already_joined_cup(player_b, cup, matches),
+    0,
+    participation_bonus
+  )
 
   rating_a_before <- rating_a_base + participation_a
   rating_b_before <- rating_b_base + participation_b
@@ -169,37 +276,35 @@ calculate_match <- function(player_a, goals_a, player_b, goals_b, stage, cup, pl
   loss_base <- rule$loss_base[1]
 
   if (goals_a > goals_b) {
-    # A wins
-    if (rating_a_before <= rating_b_before) {
-      change_a <- round(win_base * (1 + adj))
+
+    change_a <- if (rating_a_before <= rating_b_before) {
+      round(win_base * (1 + adj))
     } else {
-      change_a <- round(win_base / (1 + adj))
+      round(win_base / (1 + adj))
     }
 
-    # B loses
-    if (rating_b_before >= rating_a_before) {
-      change_b <- -round(loss_base * (1 + adj))
+    change_b <- if (rating_b_before >= rating_a_before) {
+      -round(loss_base * (1 + adj))
     } else {
-      change_b <- -round(loss_base / (1 + adj))
+      -round(loss_base / (1 + adj))
     }
 
   } else if (goals_b > goals_a) {
-    # B wins
-    if (rating_b_before <= rating_a_before) {
-      change_b <- round(win_base * (1 + adj))
+
+    change_b <- if (rating_b_before <= rating_a_before) {
+      round(win_base * (1 + adj))
     } else {
-      change_b <- round(win_base / (1 + adj))
+      round(win_base / (1 + adj))
     }
 
-    # A loses
-    if (rating_a_before >= rating_b_before) {
-      change_a <- -round(loss_base * (1 + adj))
+    change_a <- if (rating_a_before >= rating_b_before) {
+      -round(loss_base * (1 + adj))
     } else {
-      change_a <- -round(loss_base / (1 + adj))
+      -round(loss_base / (1 + adj))
     }
 
   } else {
-    # Draw
+
     pts <- draw_bonus(gap)
 
     if (rating_a_before == rating_b_before) {
@@ -230,33 +335,43 @@ build_ranking <- function(players, matches) {
 
   current <- lapply(players$player, function(p) {
 
+    base <- players %>% filter(player == p)
     pm <- matches %>% filter(player_a == p | player_b == p)
 
-    rating_change <- if (nrow(pm) == 0) 0 else
-      sum(ifelse(pm$player_a == p, pm$rating_change_a, pm$rating_change_b), na.rm = TRUE)
+    if (nrow(pm) == 0) {
+      return(tibble(
+        player = p,
+        rating = base$base_rating,
+        matches = base$base_matches,
+        wins = base$base_wins,
+        losses = base$base_losses,
+        goals_for = base$base_gf,
+        goals_against = base$base_ga
+      ))
+    }
 
-    participation <- if (nrow(pm) == 0) 0 else
-      sum(ifelse(pm$player_a == p, pm$participation_a, pm$participation_b), na.rm = TRUE)
+    rating_change <- sum(
+      ifelse(pm$player_a == p, pm$rating_change_a, pm$rating_change_b),
+      na.rm = TRUE
+    )
 
-    wins <- if (nrow(pm) == 0) 0 else
-      sum(
-        (pm$player_a == p & pm$goals_a > pm$goals_b) |
-          (pm$player_b == p & pm$goals_b > pm$goals_a)
-      )
+    participation <- sum(
+      ifelse(pm$player_a == p, pm$participation_a, pm$participation_b),
+      na.rm = TRUE
+    )
 
-    losses <- if (nrow(pm) == 0) 0 else
-      sum(
-        (pm$player_a == p & pm$goals_a < pm$goals_b) |
-          (pm$player_b == p & pm$goals_b < pm$goals_a)
-      )
+    wins <- sum(
+      (pm$player_a == p & pm$goals_a > pm$goals_b) |
+        (pm$player_b == p & pm$goals_b > pm$goals_a)
+    )
 
-    gf <- if (nrow(pm) == 0) 0 else
-      sum(ifelse(pm$player_a == p, pm$goals_a, pm$goals_b))
+    losses <- sum(
+      (pm$player_a == p & pm$goals_a < pm$goals_b) |
+        (pm$player_b == p & pm$goals_b < pm$goals_a)
+    )
 
-    ga <- if (nrow(pm) == 0) 0 else
-      sum(ifelse(pm$player_a == p, pm$goals_b, pm$goals_a))
-
-    base <- players %>% filter(player == p)
+    gf <- sum(ifelse(pm$player_a == p, pm$goals_a, pm$goals_b), na.rm = TRUE)
+    ga <- sum(ifelse(pm$player_a == p, pm$goals_b, pm$goals_a), na.rm = TRUE)
 
     tibble(
       player = p,
@@ -289,13 +404,13 @@ player_history <- function(player_name, players, matches) {
     filter(player_a == player_name | player_b == player_name) %>%
     arrange(match_id)
 
-  history <- tibble(
+  h <- tibble(
     game = 0,
     label = "Baseline",
     rating = base_rating
   )
 
-  if (nrow(pm) == 0) return(history)
+  if (nrow(pm) == 0) return(h)
 
   current <- base_rating
 
@@ -314,16 +429,16 @@ player_history <- function(player_name, players, matches) {
       row$rating_change_b
     )
 
-    current <- current + participation + delta
-
     opponent <- ifelse(
       row$player_a == player_name,
       row$player_b,
       row$player_a
     )
 
-    history <- bind_rows(
-      history,
+    current <- current + participation + delta
+
+    h <- bind_rows(
+      h,
       tibble(
         game = i,
         label = paste0(row$cup, " vs ", opponent),
@@ -332,7 +447,7 @@ player_history <- function(player_name, players, matches) {
     )
   }
 
-  history
+  h
 }
 
 # ============================================================
@@ -343,24 +458,35 @@ ui <- fluidPage(
   tags$head(
     tags$style(HTML("
       body { background:#f4f6f8; }
-      .navbar { margin-bottom:20px; }
       .cardx {
-        background:white; border-radius:12px; padding:18px;
-        box-shadow:0 2px 10px rgba(0,0,0,.08); margin-bottom:18px;
-      }
-      .metric {
-        font-size:28px; font-weight:700; margin-top:4px;
+        background:white;
+        border-radius:14px;
+        padding:18px;
+        box-shadow:0 2px 12px rgba(0,0,0,.08);
+        margin-bottom:18px;
       }
       .metric-label {
-        color:#6c757d; font-size:13px; text-transform:uppercase;
+        color:#6c757d;
+        font-size:12px;
+        text-transform:uppercase;
+        letter-spacing:.04em;
+      }
+      .metric {
+        font-size:28px;
+        font-weight:800;
       }
       .profile-title {
-        font-size:30px; font-weight:800;
+        font-size:30px;
+        font-weight:800;
       }
-      .rating-big {
-        font-size:42px; font-weight:800;
+      .admin-ok {
+        color:#138a36;
+        font-weight:700;
       }
-      .dataTables_wrapper { background:white; padding:12px; border-radius:12px; }
+      .admin-no {
+        color:#b42318;
+        font-weight:700;
+      }
     "))
   ),
 
@@ -370,48 +496,16 @@ ui <- fluidPage(
 
     tabPanel(
       "Ranking",
-      fluidRow(
-        column(
-          12,
-          div(
-            class = "cardx",
-            h3("Live Ranking"),
-            p("Click a player row to open the full player profile."),
-            DTOutput("ranking_table")
-          )
-        )
+      div(
+        class = "cardx",
+        h3("Live Ranking"),
+        p("Click a player to open the full profile."),
+        DTOutput("ranking_table")
       )
     ),
 
     tabPanel(
-      "Add Match",
-      fluidRow(
-        column(
-          5,
-          div(
-            class = "cardx",
-            textInput("cup", "Cup ID", placeholder = "Example: CUP-02"),
-            selectInput("stage", "Stage", choices = stage_rules$stage),
-            selectInput("player_a", "Player A", choices = NULL),
-            numericInput("goals_a", "Goals A", 0, min = 0),
-            selectInput("player_b", "Player B", choices = NULL),
-            numericInput("goals_b", "Goals B", 0, min = 0),
-            actionButton("add_match", "Save Match", class = "btn-primary")
-          )
-        ),
-        column(
-          7,
-          div(
-            class = "cardx",
-            h3("Latest Matches"),
-            DTOutput("matches_table")
-          )
-        )
-      )
-    ),
-
-    tabPanel(
-      "Player Profile",
+      "Players",
       fluidRow(
         column(
           12,
@@ -424,12 +518,12 @@ ui <- fluidPage(
       ),
 
       fluidRow(
-        column(2, div(class="cardx", div(class="metric-label","Current Rating"), div(class="metric", textOutput("m_rating")))),
+        column(2, div(class="cardx", div(class="metric-label","Rating"), div(class="metric", textOutput("m_rating")))),
         column(2, div(class="cardx", div(class="metric-label","Rank"), div(class="metric", textOutput("m_rank")))),
         column(2, div(class="cardx", div(class="metric-label","Matches"), div(class="metric", textOutput("m_matches")))),
         column(2, div(class="cardx", div(class="metric-label","Wins"), div(class="metric", textOutput("m_wins")))),
-        column(2, div(class="cardx", div(class="metric-label","Win Rate"), div(class="metric", textOutput("m_winrate")))),
-        column(2, div(class="cardx", div(class="metric-label","Goal Diff"), div(class="metric", textOutput("m_gd"))))
+        column(2, div(class="cardx", div(class="metric-label","Win rate"), div(class="metric", textOutput("m_winrate")))),
+        column(2, div(class="cardx", div(class="metric-label","Goal diff"), div(class="metric", textOutput("m_gd"))))
       ),
 
       fluidRow(
@@ -451,46 +545,25 @@ ui <- fluidPage(
         )
       ),
 
-      fluidRow(
-        column(
-          12,
-          div(
-            class = "cardx",
-            h3("Match History"),
-            DTOutput("player_matches")
-          )
-        )
+      div(
+        class = "cardx",
+        h3("Player Match History"),
+        DTOutput("player_matches")
       )
     ),
 
     tabPanel(
-      "Rules",
-      fluidRow(
-        column(
-          7,
-          div(
-            class = "cardx",
-            h3("Rating Rules"),
-            tags$ul(
-              tags$li("+11 participation bonus once per player per Cup ID."),
-              tags$li("Higher stages give more points for a win."),
-              tags$li("Higher stages have a lower base loss penalty."),
-              tags$li("Beating a stronger player gives more rating."),
-              tags$li("Losing to a stronger player costs less rating."),
-              tags$li("Beating a weaker player gives less rating."),
-              tags$li("Losing to a weaker player costs more rating.")
-            )
-          )
-        ),
-        column(
-          5,
-          div(
-            class = "cardx",
-            h3("Stage Values"),
-            tableOutput("rules_table")
-          )
-        )
+      "Matches",
+      div(
+        class = "cardx",
+        h3("Official Matches"),
+        DTOutput("public_matches")
       )
+    ),
+
+    tabPanel(
+      "Admin",
+      uiOutput("admin_panel")
     )
   )
 )
@@ -502,7 +575,22 @@ ui <- fluidPage(
 server <- function(input, output, session) {
 
   players <- reactiveVal(load_players())
-  matches <- reactiveVal(load_matches())
+  matches <- reactiveVal(dropbox_download_matches())
+  admin_logged_in <- reactiveVal(FALSE)
+
+  # Refresh public data from Dropbox every 15 seconds.
+  observe({
+    invalidateLater(15000, session)
+
+    latest <- tryCatch(
+      dropbox_download_matches(),
+      error = function(e) NULL
+    )
+
+    if (!is.null(latest)) {
+      matches(latest)
+    }
+  })
 
   ranking <- reactive({
     build_ranking(players(), matches())
@@ -510,8 +598,6 @@ server <- function(input, output, session) {
 
   observe({
     p <- players()$player
-    updateSelectInput(session, "player_a", choices = p)
-    updateSelectInput(session, "player_b", choices = p, selected = if (length(p) > 1) p[2] else p[1])
     updateSelectInput(session, "profile_player", choices = p)
   })
 
@@ -521,27 +607,261 @@ server <- function(input, output, session) {
         mutate(win_rate = paste0(round(win_rate, 1), "%")),
       selection = "single",
       rownames = FALSE,
-      options = list(
-        pageLength = 25,
-        dom = "tip",
-        order = list(list(0, "asc"))
+      options = list(pageLength = 25, dom = "tip")
+    )
+  })
+
+  observeEvent(input$ranking_table_rows_selected, {
+    idx <- input$ranking_table_rows_selected
+    if (length(idx) == 1) {
+      selected <- ranking()$player[idx]
+      updateSelectInput(session, "profile_player", selected = selected)
+      updateTabsetPanel(session, "main_tabs", selected = "Players")
+    }
+  })
+
+  selected_stats <- reactive({
+    req(input$profile_player)
+    ranking() %>% filter(player == input$profile_player)
+  })
+
+  output$profile_header <- renderUI({
+    s <- selected_stats()
+
+    div(
+      class = "profile-title",
+      s$player,
+      tags$span(
+        style = "font-size:16px;color:#6c757d;margin-left:12px;",
+        paste0("#", s$rank, " • Rating ", s$rating)
       )
     )
   })
 
-  # Clicking a row in Ranking opens that player's profile automatically.
-  observeEvent(input$ranking_table_rows_selected, {
-    idx <- input$ranking_table_rows_selected
-    if (length(idx) == 1) {
-      selected_player <- ranking()$player[idx]
-      updateSelectInput(session, "profile_player", selected = selected_player)
-      updateTabsetPanel(session, "main_tabs", selected = "Player Profile")
+  output$m_rating <- renderText(selected_stats()$rating)
+  output$m_rank <- renderText(paste0("#", selected_stats()$rank))
+  output$m_matches <- renderText(selected_stats()$matches)
+  output$m_wins <- renderText(selected_stats()$wins)
+  output$m_winrate <- renderText(paste0(round(selected_stats()$win_rate, 1), "%"))
+  output$m_gd <- renderText({
+    x <- selected_stats()$goal_difference
+    ifelse(x > 0, paste0("+", x), as.character(x))
+  })
+
+  output$rating_chart <- renderPlot({
+    req(input$profile_player)
+
+    h <- player_history(input$profile_player, players(), matches())
+
+    p <- ggplot(h, aes(game, rating)) +
+      geom_point(size = 3) +
+      labs(
+        x = "Official match",
+        y = "Rating",
+        title = paste(input$profile_player, "Rating History")
+      ) +
+      theme_minimal(base_size = 13)
+
+    if (nrow(h) >= 2) {
+      p <- p + geom_line(linewidth = 1.1)
     }
+
+    p
+  })
+
+  output$performance_chart <- renderPlot({
+    s <- selected_stats()
+
+    d <- tibble(
+      result = c("Wins", "Losses", "Other"),
+      count = c(
+        s$wins,
+        s$losses,
+        max(0, s$matches - s$wins - s$losses)
+      )
+    )
+
+    ggplot(d, aes(result, count)) +
+      geom_col(width = .65) +
+      geom_text(aes(label = count), vjust = -0.4, size = 5) +
+      scale_y_continuous(expand = expansion(mult = c(0, .15))) +
+      labs(x = NULL, y = "Matches") +
+      theme_minimal(base_size = 13)
+  })
+
+  output$player_matches <- renderDT({
+    req(input$profile_player)
+
+    p <- input$profile_player
+    m <- matches() %>%
+      filter(player_a == p | player_b == p) %>%
+      arrange(desc(match_id))
+
+    if (nrow(m) == 0) {
+      return(
+        datatable(
+          data.frame(Message = "No new match history after baseline."),
+          rownames = FALSE
+        )
+      )
+    }
+
+    datatable(
+      m %>%
+        mutate(
+          Opponent = ifelse(player_a == p, player_b, player_a),
+          GF = ifelse(player_a == p, goals_a, goals_b),
+          GA = ifelse(player_a == p, goals_b, goals_a),
+          Result = case_when(
+            GF > GA ~ "Win",
+            GF < GA ~ "Loss",
+            TRUE ~ "Draw"
+          ),
+          Change = ifelse(
+            player_a == p,
+            rating_change_a,
+            rating_change_b
+          ),
+          RatingAfter = ifelse(
+            player_a == p,
+            rating_a_after,
+            rating_b_after
+          )
+        ) %>%
+        transmute(
+          Date = date,
+          Cup = cup,
+          Stage = stage,
+          Opponent,
+          Score = paste(GF, "-", GA),
+          Result,
+          `Rating Change` = ifelse(Change > 0, paste0("+", Change), as.character(Change)),
+          `Rating After` = RatingAfter
+        ),
+      rownames = FALSE,
+      options = list(pageLength = 15, dom = "tip")
+    )
+  })
+
+  output$public_matches <- renderDT({
+    m <- matches()
+
+    if (nrow(m) == 0) {
+      return(
+        datatable(
+          data.frame(Message = "No new official matches yet."),
+          rownames = FALSE
+        )
+      )
+    }
+
+    datatable(
+      m %>%
+        arrange(desc(match_id)) %>%
+        transmute(
+          Date = date,
+          Cup = cup,
+          Stage = stage,
+          `Player A` = player_a,
+          Score = paste(goals_a, "-", goals_b),
+          `Player B` = player_b
+        ),
+      rownames = FALSE,
+      options = list(pageLength = 20, dom = "tip")
+    )
+  })
+
+  # ----------------------------
+  # ADMIN UI
+  # ----------------------------
+
+  output$admin_panel <- renderUI({
+
+    if (!admin_logged_in()) {
+
+      div(
+        class = "cardx",
+        h3("Admin Login"),
+        passwordInput("admin_password", "Password"),
+        actionButton("admin_login", "Login", class = "btn-primary"),
+        br(), br(),
+        div(class = "admin-no", "Match entry is locked.")
+      )
+
+    } else {
+
+      tagList(
+        div(
+          class = "cardx",
+          fluidRow(
+            column(
+              8,
+              h3("Admin"),
+              div(class = "admin-ok", "Admin access enabled.")
+            ),
+            column(
+              4,
+              actionButton("admin_logout", "Logout")
+            )
+          )
+        ),
+
+        div(
+          class = "cardx",
+          h3("Add Official Match"),
+          textInput("cup", "Cup ID", placeholder = "Example: CUP-02"),
+          selectInput("stage", "Stage", choices = stage_rules$stage),
+          selectInput("player_a", "Player A", choices = players()$player),
+          numericInput("goals_a", "Goals A", 0, min = 0),
+          selectInput("player_b", "Player B", choices = players()$player),
+          numericInput("goals_b", "Goals B", 0, min = 0),
+          actionButton("add_match", "Save Match", class = "btn-success")
+        ),
+
+        div(
+          class = "cardx",
+          h3("Storage"),
+          p(
+            if (dropbox_enabled()) {
+              paste("Dropbox:", DROPBOX_MATCHES_PATH)
+            } else {
+              paste("Local testing mode:", LOCAL_MATCHES_FILE)
+            }
+          ),
+          downloadButton("download_matches", "Download Backup CSV")
+        )
+      )
+    }
+  })
+
+  observeEvent(input$admin_login, {
+    req(input$admin_password)
+
+    if (is_admin_password_valid(input$admin_password)) {
+      admin_logged_in(TRUE)
+      showNotification("Admin login successful.", type = "message")
+    } else {
+      admin_logged_in(FALSE)
+      showNotification("Incorrect password.", type = "error")
+    }
+  })
+
+  observeEvent(input$admin_logout, {
+    admin_logged_in(FALSE)
   })
 
   observeEvent(input$add_match, {
 
-    req(input$cup, input$stage, input$player_a, input$player_b)
+    # SERVER-SIDE SECURITY CHECK:
+    # hidden UI alone is not considered authorization.
+    req(admin_logged_in())
+
+    req(
+      input$cup,
+      input$stage,
+      input$player_a,
+      input$player_b
+    )
 
     if (trimws(input$cup) == "") {
       showNotification("Cup ID is required.", type = "error")
@@ -549,7 +869,7 @@ server <- function(input, output, session) {
     }
 
     if (input$player_a == input$player_b) {
-      showNotification("Player A and Player B must be different.", type = "error")
+      showNotification("Players must be different.", type = "error")
       return()
     }
 
@@ -567,7 +887,11 @@ server <- function(input, output, session) {
       matches = m
     )
 
-    new_id <- ifelse(nrow(m) == 0, 1, max(m$match_id, na.rm = TRUE) + 1)
+    new_id <- if (nrow(m) == 0) {
+      1L
+    } else {
+      as.integer(max(m$match_id, na.rm = TRUE) + 1L)
+    }
 
     new_match <- tibble(
       match_id = new_id,
@@ -589,154 +913,31 @@ server <- function(input, output, session) {
     )
 
     updated <- bind_rows(m, new_match)
-    save_matches(updated)
-    matches(updated)
 
-    showNotification("Match saved and ranking updated.", type = "message")
-  })
-
-  output$matches_table <- renderDT({
-    m <- matches()
-
-    if (nrow(m) == 0) return(datatable(data.frame(Message = "No new matches yet."), rownames = FALSE))
-
-    datatable(
-      m %>%
-        arrange(desc(match_id)) %>%
-        transmute(
-          Date = date,
-          Cup = cup,
-          Stage = stage,
-          `Player A` = player_a,
-          Score = paste(goals_a, "-", goals_b),
-          `Player B` = player_b,
-          `A Change` = paste0(ifelse(rating_change_a > 0, "+", ""), rating_change_a),
-          `B Change` = paste0(ifelse(rating_change_b > 0, "+", ""), rating_change_b)
-        ),
-      rownames = FALSE,
-      options = list(pageLength = 10, dom = "tip")
-    )
-  })
-
-  selected_stats <- reactive({
-    req(input$profile_player)
-    ranking() %>% filter(player == input$profile_player)
-  })
-
-  output$profile_header <- renderUI({
-    s <- selected_stats()
-
-    div(
-      class = "profile-title",
-      s$player,
-      tags$span(
-        style = "font-size:16px;color:#6c757d;margin-left:14px;",
-        paste0("#", s$rank, " • Rating ", s$rating)
+    tryCatch({
+      dropbox_upload_matches(updated)
+      matches(updated)
+      showNotification(
+        "Match saved. Ranking and Dropbox backup updated.",
+        type = "message"
       )
-    )
-  })
-
-  output$m_rating <- renderText(selected_stats()$rating)
-  output$m_rank <- renderText(paste0("#", selected_stats()$rank))
-  output$m_matches <- renderText(selected_stats()$matches)
-  output$m_wins <- renderText(selected_stats()$wins)
-  output$m_winrate <- renderText(paste0(round(selected_stats()$win_rate, 1), "%"))
-  output$m_gd <- renderText({
-    x <- selected_stats()$goal_difference
-    ifelse(x > 0, paste0("+", x), x)
-  })
-
-  output$rating_chart <- renderPlot({
-    req(input$profile_player)
-
-    h <- player_history(input$profile_player, players(), matches())
-
-    ggplot(h, aes(x = game, y = rating)) +
-      geom_line(linewidth = 1.2) +
-      geom_point(size = 2.8) +
-      geom_hline(
-        yintercept = players() %>% filter(player == input$profile_player) %>% pull(base_rating),
-        linetype = 2,
-        alpha = .45
-      ) +
-      scale_x_continuous(breaks = h$game) +
-      labs(
-        x = "Match",
-        y = "Rating",
-        title = paste(input$profile_player, "Rating History")
-      ) +
-      theme_minimal(base_size = 13)
-  })
-
-  output$performance_chart <- renderPlot({
-    s <- selected_stats()
-
-    d <- tibble(
-      result = c("Wins", "Losses", "Other"),
-      count = c(
-        s$wins,
-        s$losses,
-        max(0, s$matches - s$wins - s$losses)
+    }, error = function(e) {
+      showNotification(
+        paste("Save failed:", conditionMessage(e)),
+        type = "error",
+        duration = NULL
       )
-    )
-
-    ggplot(d, aes(x = result, y = count)) +
-      geom_col(width = .65) +
-      geom_text(aes(label = count), vjust = -0.35, size = 5) +
-      scale_y_continuous(expand = expansion(mult = c(0, .15))) +
-      labs(x = NULL, y = "Matches") +
-      theme_minimal(base_size = 13)
+    })
   })
 
-  output$player_matches <- renderDT({
-    req(input$profile_player)
-
-    p <- input$profile_player
-
-    m <- matches() %>%
-      filter(player_a == p | player_b == p) %>%
-      arrange(desc(match_id))
-
-    if (nrow(m) == 0) {
-      return(datatable(data.frame(Message = "No new match history after baseline."), rownames = FALSE))
+  output$download_matches <- downloadHandler(
+    filename = function() {
+      paste0("football_matches_backup_", Sys.Date(), ".csv")
+    },
+    content = function(file) {
+      write_csv(matches(), file)
     }
-
-    history <- m %>%
-      mutate(
-        Opponent = ifelse(player_a == p, player_b, player_a),
-        GF = ifelse(player_a == p, goals_a, goals_b),
-        GA = ifelse(player_a == p, goals_b, goals_a),
-        Result = case_when(
-          GF > GA ~ "Win",
-          GF < GA ~ "Loss",
-          TRUE ~ "Draw"
-        ),
-        `Rating Change` = ifelse(player_a == p, rating_change_a, rating_change_b),
-        `Rating After` = ifelse(player_a == p, rating_a_after, rating_b_after)
-      ) %>%
-      transmute(
-        Date = date,
-        Cup = cup,
-        Stage = stage,
-        Opponent,
-        Score = paste(GF, "-", GA),
-        Result,
-        `Rating Change` = ifelse(`Rating Change` > 0,
-                                 paste0("+", `Rating Change`),
-                                 as.character(`Rating Change`)),
-        `Rating After`
-      )
-
-    datatable(
-      history,
-      rownames = FALSE,
-      options = list(pageLength = 15, dom = "tip")
-    )
-  })
-
-  output$rules_table <- renderTable({
-    stage_rules
-  }, striped = TRUE, bordered = TRUE)
+  )
 }
 
 shinyApp(ui, server)
